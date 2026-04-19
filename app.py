@@ -2,9 +2,8 @@
 """
 MasterDock – Molecular Interaction Analysis Platform
 Docking engine : SwissDock REST API (https://swissdock.ch:8443)
-                 Engines: Attracting Cavities 2.0 (AC) or AutoDock Vina
-Visualization  : py3Dmol (3D) + RDKit (2D)
-Parsing        : Biopython (PDB) + RDKit (SDF / Mol2)
+Visualization  : 3Dmol.js via CDN (3D) + RDKit (2D)
+Parsing        : Biopython (PDB) + RDKit (SDF)
 """
 
 import io
@@ -15,7 +14,6 @@ import tempfile
 import time
 
 import pandas as pd
-import py3Dmol
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -36,18 +34,18 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 #  SwissDock API constants
 # ─────────────────────────────────────────────────────────────────────────────
-SD_BASE   = "https://swissdock.ch:8443"
-SD_HELLO  = f"{SD_BASE}/"
-SD_PREPLIG    = f"{SD_BASE}/preplig"
-SD_PREPTARGET = f"{SD_BASE}/preptarget"
-SD_SETPARAMS  = f"{SD_BASE}/setparameters"
-SD_STARTDOCK  = f"{SD_BASE}/startdock"
+SD_BASE        = "https://swissdock.ch:8443"
+SD_HELLO       = f"{SD_BASE}/"
+SD_PREPLIG     = f"{SD_BASE}/preplig"
+SD_PREPTARGET  = f"{SD_BASE}/preptarget"
+SD_SETPARAMS   = f"{SD_BASE}/setparameters"
+SD_STARTDOCK   = f"{SD_BASE}/startdock"
 SD_CHECKSTATUS = f"{SD_BASE}/checkstatus"
-SD_RETRIEVE   = f"{SD_BASE}/retrievesession"
-SD_CANCEL     = f"{SD_BASE}/cancelsession"
+SD_RETRIEVE    = f"{SD_BASE}/retrievesession"
+SD_CANCEL      = f"{SD_BASE}/cancelsession"
 
-POLL_INTERVAL = 15   # seconds between status polls
-MAX_POLLS     = 240  # 240 × 15 s = 60 min max wait
+POLL_INTERVAL = 15    # seconds between status polls
+MAX_POLLS     = 240   # 240 × 15 s = 60 min max wait
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Custom CSS
@@ -67,6 +65,45 @@ st.markdown("""
   }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3D Viewer — uses 3Dmol.js via CDN (no IPython required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_3d(content: str, fmt: str, height: int = 420) -> str:
+    """
+    Return a self-contained HTML page that renders a 3Dmol.js viewer.
+
+    KEY FIX: py3Dmol._repr_html_() raises
+        ImportError: This function requires an active IPython notebook.
+    when used outside Jupyter. We bypass py3Dmol entirely and call the
+    underlying 3Dmol.js library directly via CDN, which works perfectly
+    inside Streamlit's components.html().
+    """
+    # Escape the molecule data so it is safe inside a JS string.
+    # Replace backslashes first, then single quotes.
+    safe = content.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    return f"""<!DOCTYPE html>
+<html>
+<head><style>
+  body {{ margin:0; padding:0; background:#1e1e2e; }}
+  #viewer {{ width:100%; height:{height}px; position:relative; }}
+</style></head>
+<body>
+  <div id="viewer"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.3/3Dmol-min.js"></script>
+  <script>
+    var config = {{ backgroundColor: 0x1e1e2e }};
+    var viewer = $3Dmol.createViewer(document.getElementById('viewer'), config);
+    var data = '{safe}';
+    viewer.addModel(data, '{fmt.lower()}');
+    viewer.setStyle({{}}, {{ stick: {{}} }});
+    viewer.zoomTo();
+    viewer.render();
+  </script>
+</body>
+</html>"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,14 +134,6 @@ def parse_sdf(sdf_content: str):
     return [m for m in suppl if m is not None]
 
 
-def render_3d(content: str, fmt: str, height: int = 420) -> str:
-    view = py3Dmol.view(width="100%", height=height)
-    view.addModel(content, fmt.lower())
-    view.setStyle({"stick": {}})
-    view.zoomTo()
-    return view._repr_html_()
-
-
 def render_2d(mol, size=(280, 280)):
     return Draw.MolToImage(mol, size=size) if mol else None
 
@@ -117,39 +146,29 @@ def mol_props(mol) -> dict:
     }
 
 
-def sdf_to_mol2_rdkit(sdf_content: str) -> str | None:
-    """
-    Convert the first molecule in an SDF string to Mol2 format using RDKit.
-    SwissDock AC requires a Mol2 ligand file.
-    """
+def sdf_to_mol2_via_obabel(sdf_content: str):
+    """Convert first SDF molecule to Mol2 via obabel. Returns bytes or None."""
     mols = parse_sdf(sdf_content)
     if not mols:
         return None
-    mol = mols[0]
-    # Add 3-D coords if missing
-    if mol.GetNumConformers() == 0:
-        mol = Chem.AddHs(mol)
-        AllChem.EmbedMolecule(mol, AllChem.ETKDGv2())
-        AllChem.MMFFOptimizeMolecule(mol)
-    tmp = tempfile.NamedTemporaryFile(suffix=".mol2", delete=False)
-    tmp.close()
-    Chem.MolToMolFile(mol, tmp.name)   # write as SDF first
-    # RDKit doesn't write Mol2 natively; use a simple conversion via file
-    # We'll return the SDF content and tell the user the limitation
-    mol2_path = tmp.name.replace(".mol2", "_out.mol2")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sdf", delete=False) as f:
+        f.write(sdf_content)
+        sdf_path = f.name
+    mol2_path = sdf_path.replace(".sdf", ".mol2")
     try:
         import subprocess
         subprocess.run(
-            ["obabel", tmp.name, "-O", mol2_path],
+            ["obabel", sdf_path, "-O", mol2_path],
             capture_output=True, check=True,
         )
-        with open(mol2_path) as f:
-            return f.read()
+        if os.path.exists(mol2_path):
+            with open(mol2_path, "rb") as f:
+                return f.read()
+        return None
     except Exception:
-        # obabel not available — return None so caller falls back to SMILES
         return None
     finally:
-        for p in (tmp.name, mol2_path):
+        for p in (sdf_path, mol2_path):
             if os.path.exists(p):
                 os.remove(p)
 
@@ -159,7 +178,6 @@ def sdf_to_mol2_rdkit(sdf_content: str) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sd_check_server() -> bool:
-    """Ping the SwissDock API. Returns True if alive."""
     try:
         r = requests.get(SD_HELLO, timeout=10, verify=False)
         return "Hello World" in r.text
@@ -167,24 +185,12 @@ def sd_check_server() -> bool:
         return False
 
 
-def sd_prepare_ligand(
-    mol2_bytes: bytes | None = None,
-    smiles: str | None = None,
-    session_number: str | None = None,
-    use_vina: bool = False,
-) -> tuple[bool, str]:
-    """
-    Upload and prepare the ligand.
-    Returns (success, session_number_or_error).
-
-    Priority: mol2_bytes > smiles
-    """
+def sd_prepare_ligand(mol2_bytes=None, smiles=None, session_number=None, use_vina=False):
     params = {}
     if session_number:
         params["sessionNumber"] = session_number
     if use_vina:
         params["Vina"] = ""
-
     try:
         if mol2_bytes:
             files = {"myLig": ("ligand.mol2", mol2_bytes, "chemical/x-mol2")}
@@ -193,26 +199,20 @@ def sd_prepare_ligand(
             params["mySMILES"] = smiles
             r = requests.get(SD_PREPLIG, params=params, timeout=120, verify=False)
         else:
-            return False, "No ligand input provided (need Mol2 bytes or SMILES)."
-
+            return False, "No ligand input provided."
         text = r.text.strip()
         m = re.search(r"Session number:\s*(\d+)", text)
         if m:
             return True, m.group(1)
-        # might already have a session from a previous step
         m2 = re.search(r"Using session number:\s*(\d+)", text)
         if m2:
             return True, m2.group(1)
-        return False, f"Unexpected response from SwissDock:\n{text}"
+        return False, f"Unexpected SwissDock response:\n{text}"
     except Exception as e:
         return False, f"Network error preparing ligand: {e}"
 
 
-def sd_prepare_target(
-    pdb_bytes: bytes,
-    session_number: str,
-) -> tuple[bool, str]:
-    """Upload and prepare the receptor PDB. Returns (success, message)."""
+def sd_prepare_target(pdb_bytes: bytes, session_number: str):
     try:
         files = {"myTarget": ("target.pdb", pdb_bytes, "chemical/x-pdb")}
         params = {"sessionNumber": session_number}
@@ -225,17 +225,9 @@ def sd_prepare_target(
         return False, f"Network error preparing target: {e}"
 
 
-def sd_set_parameters(
-    session_number: str,
-    center_x: float, center_y: float, center_z: float,
-    size_x: float = 20.0, size_y: float = 20.0, size_z: float = 20.0,
-    exhaust: int = 90,
-    cavity: int = 70,
-    ric: int = 2,
-    use_vina: bool = False,
-    job_name: str = "MasterDock",
-) -> tuple[bool, str]:
-    """Set docking parameters and check session. Returns (can_submit, message)."""
+def sd_set_parameters(session_number, center_x, center_y, center_z,
+                      size_x=20.0, size_y=20.0, size_z=20.0,
+                      exhaust=90, cavity=70, ric=2, use_vina=False, job_name="MasterDock"):
     params = {
         "sessionNumber": session_number,
         "boxCenter": f"{center_x}_{center_y}_{center_z}",
@@ -255,19 +247,16 @@ def sd_set_parameters(
         return False, f"Network error setting parameters: {e}"
 
 
-def sd_start_docking(session_number: str) -> tuple[bool, str]:
-    """Submit the docking job. Returns (success, message)."""
+def sd_start_docking(session_number: str):
     try:
         r = requests.get(SD_STARTDOCK, params={"sessionNumber": session_number}, timeout=60, verify=False)
         text = r.text.strip()
-        ok = "submitted" in text.lower()
-        return ok, text
+        return "submitted" in text.lower(), text
     except Exception as e:
         return False, f"Network error starting docking: {e}"
 
 
 def sd_check_status(session_number: str) -> str:
-    """Return raw status text from SwissDock."""
     try:
         r = requests.get(SD_CHECKSTATUS, params={"sessionNumber": session_number}, timeout=30, verify=False)
         return r.text.strip()
@@ -275,15 +264,10 @@ def sd_check_status(session_number: str) -> str:
         return f"Error checking status: {e}"
 
 
-def sd_retrieve_results(session_number: str) -> bytes | None:
-    """Download the results tar.gz. Returns raw bytes or None."""
+def sd_retrieve_results(session_number: str):
     try:
-        r = requests.get(
-            SD_RETRIEVE,
-            params={"sessionNumber": session_number},
-            timeout=300,
-            verify=False,
-        )
+        r = requests.get(SD_RETRIEVE, params={"sessionNumber": session_number},
+                         timeout=300, verify=False)
         if r.status_code == 200 and len(r.content) > 100:
             return r.content
         return None
@@ -293,51 +277,35 @@ def sd_retrieve_results(session_number: str) -> bytes | None:
 
 def sd_cancel(session_number: str) -> str:
     try:
-        r = requests.get(SD_CANCEL, params={"sessionNumber": session_number}, timeout=30, verify=False)
+        r = requests.get(SD_CANCEL, params={"sessionNumber": session_number},
+                         timeout=30, verify=False)
         return r.text.strip()
     except Exception as e:
         return str(e)
 
 
 def parse_results_tarball(tar_bytes: bytes) -> dict:
-    """
-    Extract docking results from the SwissDock tar.gz archive.
-    Returns a dict with keys: 'poses_pdb', 'scores_df', 'log_text', 'files'
-    """
     result = {"poses_pdb": None, "scores_df": None, "log_text": None, "files": []}
     try:
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
             members = tar.getmembers()
             result["files"] = [m.name for m in members]
-
             for member in members:
                 f = tar.extractfile(member)
                 if f is None:
                     continue
-                raw = f.read()
-
+                raw  = f.read()
                 name = member.name.lower()
-
-                # Docked poses — AC produces cluster*.pdb, Vina produces out.pdbqt
                 if name.endswith(".pdb") and "cluster" in name:
                     result["poses_pdb"] = raw.decode("utf-8", errors="ignore")
-
                 elif name.endswith(".pdbqt") and "out" in name:
                     result["poses_pdb"] = raw.decode("utf-8", errors="ignore")
-
-                # Score/energy log
-                elif name.endswith(".log") or name.endswith("results.txt") or "score" in name:
+                elif name.endswith(".log") or "score" in name or "cluster" in name:
                     result["log_text"] = raw.decode("utf-8", errors="ignore")
 
-                # Summary / clusters file (AC outputs a clusters file)
-                elif "cluster" in name and name.endswith(".txt"):
-                    result["log_text"] = raw.decode("utf-8", errors="ignore")
-
-        # Try to parse scores from log
         if result["log_text"]:
             scores = []
             for line in result["log_text"].splitlines():
-                # Vina-style: "   1   -8.5   0.000   0.000"
                 m = re.match(r"\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", line)
                 if m:
                     scores.append({
@@ -346,7 +314,6 @@ def parse_results_tarball(tar_bytes: bytes) -> dict:
                         "RMSD lb (Å)": float(m.group(3)),
                         "RMSD ub (Å)": float(m.group(4)),
                     })
-                # AC-style energy lines
                 m2 = re.match(r"\s*(\d+)\s+([-\d.]+)\s*$", line.strip())
                 if m2:
                     scores.append({
@@ -365,7 +332,6 @@ def parse_results_tarball(tar_bytes: bytes) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 for key, default in {
     "sd_session": None,
-    "docking_running": False,
     "docking_done": False,
     "result_tarball": None,
 }.items():
@@ -378,73 +344,53 @@ for key, default in {
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🧬 MasterDock")
-    st.caption("Powered by the **SwissDock REST API**")
+    st.caption("Powered by the **SwissDock REST API** · 3Dmol.js · RDKit · Biopython")
     st.markdown("---")
 
     st.markdown("### 📂 Upload Structures")
     receptor_file = st.file_uploader("Receptor PDB", type=["pdb"], key="rec_pdb")
 
-    lig_input_mode = st.radio(
-        "Ligand input format",
-        ["Upload SDF file", "Enter SMILES"],
-        horizontal=True,
-    )
+    lig_input_mode = st.radio("Ligand input", ["Upload SDF file", "Enter SMILES"], horizontal=True)
     if lig_input_mode == "Upload SDF file":
-        ligand_file = st.file_uploader("Ligand SDF", type=["sdf"], key="lig_sdf")
+        ligand_file  = st.file_uploader("Ligand SDF", type=["sdf"], key="lig_sdf")
         smiles_input = None
     else:
-        ligand_file = None
-        smiles_input = st.text_input(
-            "Ligand SMILES",
-            placeholder="e.g. CC(=O)Oc1ccccc1C(=O)O",
-        )
+        ligand_file  = None
+        smiles_input = st.text_input("Ligand SMILES", placeholder="e.g. CC(=O)Oc1ccccc1C(=O)O")
 
     st.markdown("---")
     st.markdown("### 🔬 Docking Engine")
-    engine = st.radio(
-        "Algorithm",
-        ["Attracting Cavities 2.0 (AC)", "AutoDock Vina"],
-        help="AC is more accurate; Vina is faster.",
-    )
-    use_vina = engine == "AutoDock Vina"
+    engine   = st.radio("Algorithm", ["Attracting Cavities 2.0 (AC)", "AutoDock Vina"])
+    use_vina = (engine == "AutoDock Vina")
 
     st.markdown("---")
     st.markdown("### ⚙️ Grid Box (Å)")
     c1, c2, c3 = st.columns(3)
-    center_x = c1.number_input("X", value=0.0, format="%.1f", key="cx")
-    center_y = c2.number_input("Y", value=0.0, format="%.1f", key="cy")
-    center_z = c3.number_input("Z", value=0.0, format="%.1f", key="cz")
+    center_x = c1.number_input("X", value=0.0, format="%.1f")
+    center_y = c2.number_input("Y", value=0.0, format="%.1f")
+    center_z = c3.number_input("Z", value=0.0, format="%.1f")
     c1, c2, c3 = st.columns(3)
-    size_x = c1.number_input("SX", value=20.0, format="%.1f", key="sx")
-    size_y = c2.number_input("SY", value=20.0, format="%.1f", key="sy")
-    size_z = c3.number_input("SZ", value=20.0, format="%.1f", key="sz")
+    size_x = c1.number_input("SX", value=20.0, format="%.1f")
+    size_y = c2.number_input("SY", value=20.0, format="%.1f")
+    size_z = c3.number_input("SZ", value=20.0, format="%.1f")
 
     st.markdown("### 🎛️ Sampling")
     if use_vina:
-        exhaust = st.slider("Exhaustiveness", 1, 64, 8)
-        cavity, ric = 70, 2        # unused for Vina
+        exhaust       = st.slider("Exhaustiveness", 1, 64, 8)
+        cavity, ric   = 70, 2
     else:
-        exhaust = st.select_slider(
-            "Exhaustivity (rotational step °)",
-            options=[180, 90, 60],
-            value=90,
-            help="180=low, 90=medium (default), 60=high",
-        )
-        cavity = st.select_slider(
-            "Cavity prioritization",
-            options=[50, 60, 70],
-            value=70,
-            help="70=buried (default), 60=medium, 50=shallow",
-        )
-        ric = st.number_input("Random initial conditions", value=2, min_value=1)
+        exhaust = st.select_slider("Exhaustivity (°)", options=[180, 90, 60], value=90)
+        cavity  = st.select_slider("Cavity prioritization", options=[50, 60, 70], value=70)
+        ric     = st.number_input("Random initial conditions", value=2, min_value=1)
 
-    job_name = st.text_input("Job name (optional)", value="MasterDock")
+    job_name = st.text_input("Job name", value="MasterDock")
 
     st.markdown("---")
     submit_btn = st.button(
         "🚀 Submit to SwissDock",
-        disabled=(receptor_file is None
-                  or (ligand_file is None and not smiles_input)),
+        disabled=(receptor_file is None and True
+                  if (ligand_file is None and not smiles_input) else
+                  receptor_file is None),
         use_container_width=True,
         type="primary",
     )
@@ -452,9 +398,9 @@ with st.sidebar:
     if st.session_state.sd_session:
         st.markdown("---")
         st.markdown(f"**Session:** `{st.session_state.sd_session}`")
-        poll_btn   = st.button("🔄 Check Status", use_container_width=True)
-        cancel_btn = st.button("🛑 Cancel Job",   use_container_width=True)
-        fetch_btn  = st.button("📥 Fetch Results", use_container_width=True)
+        poll_btn   = st.button("🔄 Check Status",  use_container_width=True)
+        cancel_btn = st.button("🛑 Cancel Job",     use_container_width=True)
+        fetch_btn  = st.button("📥 Fetch Results",  use_container_width=True)
     else:
         poll_btn = cancel_btn = fetch_btn = False
 
@@ -465,15 +411,14 @@ with st.sidebar:
 st.title("Molecular Interaction Analysis Platform")
 st.markdown(
     "Upload your **Receptor PDB** and **Ligand SDF** (or SMILES) in the sidebar, "
-    "configure the grid box, and click **🚀 Submit to SwissDock**."
+    "set the grid box, then click **🚀 Submit to SwissDock**."
 )
 
-# Server health
+# Server ping
 if not sd_check_server():
     st.warning(
-        "⚠️ The SwissDock server (`swissdock.ch:8443`) could not be reached right now. "
-        "The molecular viewer and file parsing will still work. "
-        "Try submitting again in a few minutes."
+        "⚠️ SwissDock server (`swissdock.ch:8443`) is unreachable right now. "
+        "Visualization still works. Try submitting in a few minutes."
     )
 
 receptor_content = None
@@ -536,10 +481,7 @@ if ligand_file is not None:
 
 elif smiles_input:
     st.markdown("---")
-    st.markdown(
-        '<div class="section-header">🟢 Ligand: SMILES input</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="section-header">🟢 Ligand: SMILES input</div>', unsafe_allow_html=True)
     mol = Chem.MolFromSmiles(smiles_input)
     if mol:
         st.success("✅ Valid SMILES")
@@ -552,44 +494,35 @@ elif smiles_input:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Submit to SwissDock
+#  SwissDock submission
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown(
-    '<div class="section-header">⚗️ SwissDock Docking</div>',
-    unsafe_allow_html=True,
-)
+st.markdown('<div class="section-header">⚗️ SwissDock Docking</div>', unsafe_allow_html=True)
 
 if submit_btn:
     st.session_state.docking_done   = False
     st.session_state.result_tarball = None
-
     log_area = st.empty()
 
-    def log(msg: str):
-        log_area.markdown(
-            f'<div class="api-box">🔹 {msg}</div>', unsafe_allow_html=True
-        )
+    def log(msg):
+        log_area.markdown(f'<div class="api-box">🔹 {msg}</div>', unsafe_allow_html=True)
 
-    # ── Step 1: Prepare ligand ───────────────────────────────────────────────
-    log("Step 1/5 — Uploading and preparing ligand on SwissDock…")
-
+    # Step 1 — prepare ligand
+    log("Step 1/5 — Uploading ligand to SwissDock…")
     mol2_bytes = None
+    ok = False
+
     if ligand_file is not None and ligand_content:
-        # Try to get a Mol2 from the SDF
-        mol2_str = sdf_to_mol2_rdkit(ligand_content)
-        if mol2_str:
-            mol2_bytes = mol2_str.encode()
+        mol2_bytes = sdf_to_mol2_via_obabel(ligand_content)
+        if mol2_bytes:
+            ok, result = sd_prepare_ligand(mol2_bytes=mol2_bytes, use_vina=use_vina)
         else:
-            # Fall back: derive SMILES from first molecule
+            # fallback: SMILES derived from first molecule
             if ligand_mols:
-                smiles_fallback = Chem.MolToSmiles(ligand_mols[0])
-                ok, result = sd_prepare_ligand(
-                    smiles=smiles_fallback,
-                    use_vina=use_vina,
-                )
+                fb_smiles = Chem.MolToSmiles(ligand_mols[0])
+                ok, result = sd_prepare_ligand(smiles=fb_smiles, use_vina=use_vina)
             else:
-                st.error("Cannot parse the SDF file into molecules.")
+                st.error("Cannot parse the SDF file.")
                 st.stop()
     elif smiles_input:
         ok, result = sd_prepare_ligand(smiles=smiles_input, use_vina=use_vina)
@@ -597,83 +530,69 @@ if submit_btn:
         st.error("Please upload an SDF file or enter a SMILES string.")
         st.stop()
 
-    if mol2_bytes:
-        ok, result = sd_prepare_ligand(mol2_bytes=mol2_bytes, use_vina=use_vina)
-
     if not ok:
         st.error(f"❌ Ligand preparation failed:\n{result}")
         st.stop()
 
     session_num = result
     st.session_state.sd_session = session_num
-    log(f"Step 1/5 — ✅ Ligand prepared. Session number: **{session_num}**")
+    log(f"Step 1/5 — ✅ Ligand prepared. Session: **{session_num}**")
 
-    # ── Step 2: Prepare target ───────────────────────────────────────────────
-    log("Step 2/5 — Uploading and preparing receptor on SwissDock…")
-
+    # Step 2 — prepare target
+    log("Step 2/5 — Uploading receptor to SwissDock…")
     if receptor_content is None:
         st.error("No receptor loaded. Please upload a PDB file.")
         st.stop()
 
-    ok, msg = sd_prepare_target(
-        pdb_bytes=receptor_content.encode(),
-        session_number=session_num,
-    )
+    ok, msg = sd_prepare_target(receptor_content.encode(), session_num)
     if not ok:
         st.error(f"❌ Target preparation failed:\n{msg}")
         st.stop()
     log("Step 2/5 — ✅ Receptor prepared.")
 
-    # ── Step 3: Set parameters ────────────────────────────────────────────────
+    # Step 3 — set parameters
     log("Step 3/5 — Setting docking parameters…")
     can_submit, param_msg = sd_set_parameters(
-        session_number=session_num,
-        center_x=center_x, center_y=center_y, center_z=center_z,
-        size_x=size_x, size_y=size_y, size_z=size_z,
-        exhaust=int(exhaust),
-        cavity=int(cavity),
-        ric=int(ric),
-        use_vina=use_vina,
-        job_name=job_name or "MasterDock",
+        session_num,
+        center_x, center_y, center_z,
+        size_x, size_y, size_z,
+        int(exhaust), int(cavity), int(ric),
+        use_vina, job_name or "MasterDock",
     )
-    with st.expander("SwissDock parameter confirmation", expanded=False):
+    with st.expander("SwissDock parameter confirmation"):
         st.code(param_msg)
 
     if not can_submit:
         st.error(
-            "❌ SwissDock cannot submit this job. Common reasons:\n"
-            "- No attractive cavity found in the search box → adjust Center X/Y/Z\n"
-            "- Estimated calculation time exceeds server limit → reduce box size or exhaustiveness"
+            "❌ SwissDock cannot submit this job.\n"
+            "- No cavity found → adjust Center X/Y/Z to the binding site\n"
+            "- Calculation too long → reduce box size or exhaustiveness"
         )
         st.stop()
-    log("Step 3/5 — ✅ Parameters accepted. Session can be submitted.")
+    log("Step 3/5 — ✅ Parameters accepted.")
 
-    # ── Step 4: Start docking ─────────────────────────────────────────────────
-    log("Step 4/5 — Submitting docking job to SwissDock queue…")
+    # Step 4 — start docking
+    log("Step 4/5 — Submitting to SwissDock queue…")
     ok, start_msg = sd_start_docking(session_num)
     if not ok:
         st.error(f"❌ Failed to start docking:\n{start_msg}")
         st.stop()
-    log("Step 4/5 — ✅ Job submitted! Polling for results…")
+    log("Step 4/5 — ✅ Job submitted. Polling for results…")
 
-    # ── Step 5: Poll until done ───────────────────────────────────────────────
+    # Step 5 — poll
     progress_bar = st.progress(0, text="Waiting in queue…")
     status_box   = st.empty()
 
     for poll_i in range(MAX_POLLS):
         time.sleep(POLL_INTERVAL)
         status = sd_check_status(session_num)
-        status_box.info(f"⏳ Status: {status}")
-
-        progress_bar.progress(
-            min((poll_i + 1) / MAX_POLLS, 0.99),
-            text=f"Poll {poll_i+1}: {status[:80]}",
-        )
+        status_box.info(f"⏳ {status}")
+        progress_bar.progress(min((poll_i + 1) / MAX_POLLS, 0.99),
+                              text=f"Poll {poll_i+1}: {status[:80]}")
 
         if "finished" in status.lower():
-            progress_bar.progress(1.0, text="✅ Docking finished!")
+            progress_bar.progress(1.0, text="✅ Done!")
             log("Step 5/5 — ✅ Docking complete! Retrieving results…")
-
             tarball = sd_retrieve_results(session_num)
             if tarball:
                 st.session_state.result_tarball = tarball
@@ -683,109 +602,83 @@ if submit_btn:
             break
 
         if "error" in status.lower() or "failed" in status.lower():
-            st.error(f"❌ SwissDock reported an error: {status}")
+            st.error(f"❌ SwissDock error: {status}")
             break
     else:
         st.warning(
-            "Job is taking longer than 60 minutes. "
-            "Use **Check Status** and **Fetch Results** buttons once it finishes."
+            "Job taking longer than 60 min. Use **Check Status** and "
+            "**Fetch Results** buttons in the sidebar once it finishes."
         )
 
-# ── Manual controls (poll / cancel / fetch) ───────────────────────────────────
+# Manual controls
 if poll_btn and st.session_state.sd_session:
-    status = sd_check_status(st.session_state.sd_session)
-    st.info(f"Status: {status}")
+    st.info(f"Status: {sd_check_status(st.session_state.sd_session)}")
 
 if cancel_btn and st.session_state.sd_session:
-    msg = sd_cancel(st.session_state.sd_session)
-    st.warning(f"Cancel response: {msg}")
+    st.warning(sd_cancel(st.session_state.sd_session))
     st.session_state.sd_session = None
 
 if fetch_btn and st.session_state.sd_session:
-    with st.spinner("Fetching results from SwissDock…"):
+    with st.spinner("Fetching results…"):
         tarball = sd_retrieve_results(st.session_state.sd_session)
     if tarball:
         st.session_state.result_tarball = tarball
         st.session_state.docking_done   = True
         st.success("Results fetched!")
     else:
-        st.error("Could not fetch results. The job may not be finished yet.")
+        st.error("Not ready yet — try again in a moment.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Display Results
+#  Results
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.docking_done and st.session_state.result_tarball:
     st.markdown("---")
-    st.markdown(
-        '<div class="section-header">📊 Docking Results</div>',
-        unsafe_allow_html=True,
-    )
-
+    st.markdown('<div class="section-header">📊 Docking Results</div>', unsafe_allow_html=True)
     parsed = parse_results_tarball(st.session_state.result_tarball)
 
-    # Download button for raw results
     st.download_button(
-        label="⬇️ Download full results (.tar.gz)",
+        "⬇️ Download full results (.tar.gz)",
         data=st.session_state.result_tarball,
         file_name=f"swissdock_{st.session_state.sd_session}.tar.gz",
         mime="application/gzip",
     )
 
-    with st.expander("📁 Files in result archive"):
+    with st.expander("📁 Files in archive"):
         st.write(parsed["files"])
 
-    # Scores table
     if parsed["scores_df"] is not None:
         st.subheader("📈 Docking Scores")
         st.dataframe(parsed["scores_df"], use_container_width=True)
     elif parsed["log_text"]:
-        st.subheader("📋 Score / Log Output")
-        st.code(parsed["log_text"], language="text")
-    else:
-        st.info("No structured scores found in the results. Check the raw archive.")
+        st.subheader("📋 Log Output")
+        st.code(parsed["log_text"])
 
-    # 3-D viewer of best pose
     if parsed["poses_pdb"]:
+        pose_fmt = "pdbqt" if "REMARK VINA" in parsed["poses_pdb"] else "pdb"
         st.subheader("🔬 Docked Poses — 3D Viewer")
-        pose_fmt = "pdbqt" if parsed["poses_pdb"].startswith("REMARK VINA") else "pdb"
         with st.expander("Best docked pose", expanded=True):
-            components.html(
-                render_3d(parsed["poses_pdb"], pose_fmt, 450), height=470
-            )
-        # 2-D of first pose (try parsing as SDF/PDB via RDKit)
-        try:
-            pose_mol = Chem.MolFromPDBBlock(parsed["poses_pdb"], sanitize=False)
-            if pose_mol:
-                img = render_2d(pose_mol)
-                if img:
-                    st.image(img, caption="Top pose (2D)", width=280)
-        except Exception:
-            pass
+            components.html(render_3d(parsed["poses_pdb"], pose_fmt, 450), height=470)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Welcome / help screen
+#  Welcome screen
 # ─────────────────────────────────────────────────────────────────────────────
 if receptor_file is None and ligand_file is None and not smiles_input:
     st.info(
         "**👈 Upload your structures in the sidebar to get started.**\n\n"
-        "**Docking workflow:**\n"
-        "1. Upload **Receptor PDB** — any standard PDB file\n"
-        "2. Upload **Ligand SDF** or enter a **SMILES** string\n"
-        "3. Set the **Grid Box** center (X/Y/Z) and size (Å) to cover the binding site\n"
-        "4. Choose **Attracting Cavities** (accurate) or **AutoDock Vina** (fast)\n"
-        "5. Click **🚀 Submit to SwissDock** — the job runs on SIB's servers\n"
-        "6. Results appear automatically when the job finishes (or use **Fetch Results**)\n\n"
-        "> **No local installation needed.** All docking runs on the SwissDock server "
-        "at the Swiss Institute of Bioinformatics. Free for academic use.\n\n"
-        "> **Note on Mol2 format:** SwissDock's AC engine prefers Mol2 ligand files. "
-        "If OpenBabel (`obabel`) is not installed, the app falls back to SMILES submission."
+        "**Workflow:**\n"
+        "1. Upload **Receptor PDB** → 3D viewer + stats\n"
+        "2. Upload **Ligand SDF** or type a **SMILES** string → 3D/2D viewer\n"
+        "3. Set **Grid Box** center (X/Y/Z) and size over the binding site\n"
+        "4. Choose **Attracting Cavities** (accurate) or **Vina** (fast)\n"
+        "5. Click **🚀 Submit to SwissDock** — docking runs on SIB's servers\n"
+        "6. Results appear automatically (or use **Fetch Results** for long jobs)\n\n"
+        "> Free for academic use · No local software installation required"
     )
 
 st.markdown("---")
 st.caption(
-    "MasterDock · Docking: **SwissDock REST API** (SIB, UNIL) · "
-    "py3Dmol · RDKit · Biopython · "
-    "[SwissDock 2024 paper](https://academic.oup.com/nar/article/52/W1/W324/7660078)"
+    "MasterDock · Docking: SwissDock REST API (SIB / UNIL) · "
+    "3D: 3Dmol.js · Cheminformatics: RDKit · Parsing: Biopython"
 )
