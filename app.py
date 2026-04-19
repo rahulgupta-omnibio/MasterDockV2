@@ -128,80 +128,69 @@ def ns_headers(api_key: str) -> dict:
 def ns_submit_diffdock(api_key: str, pdb_content: str, smiles: str,
                         num_poses: int = 10):
     """
-    Submit DiffDock-L job to Neurosnap. Tries 6 encoding formats.
-    Returns (success: bool, result: str, all_responses: list).
+    Submit DiffDock-L to Neurosnap.
+    CONFIRMED WORKING: receptor = file tuple, ligand = JSON list
+    UNKNOWN: exact field name + value for Number Samples
+    Tries all combinations.
+    Returns (success, job_id_or_err, all_responses).
     """
     url = NS_SUBMIT + "?note=MasterDock"
     hdr = ns_headers(api_key)
     pdb_bytes = pdb_content.encode("utf-8")
 
-    # Canonicalise SMILES via RDKit
     try:
-        from rdkit import Chem as _Chem
-        _m = _Chem.MolFromSmiles(smiles)
-        clean_smiles = _Chem.MolToSmiles(_m) if _m else smiles
+        from rdkit import Chem as _C
+        _m = _C.MolFromSmiles(smiles)
+        clean_smiles = _C.MolToSmiles(_m) if _m else smiles
     except Exception:
         clean_smiles = smiles
 
-    formats = [
-        # 1: exact format from official Neurosnap blog docs
-        {
-            "Input Receptor": json.dumps([{"type": "pdb", "data": pdb_content}]),
-            "Input Ligand":   json.dumps([{"data": clean_smiles, "type": "smiles"}]),
-            "Number Samples": str(num_poses),
-        },
-        # 2: data key order swapped
-        {
-            "Input Receptor": json.dumps([{"data": pdb_content, "type": "pdb"}]),
-            "Input Ligand":   json.dumps([{"type": "smiles", "data": clean_smiles}]),
-            "Number Samples": str(num_poses),
-        },
-        # 3: file tuple receptor + JSON ligand
-        {
-            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
-            "Input Ligand":   json.dumps([{"data": clean_smiles, "type": "smiles"}]),
-            "Number Samples": str(num_poses),
-        },
-        # 4: file tuple receptor + plain SMILES
-        {
-            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
-            "Input Ligand":   clean_smiles,
-            "Number Samples": str(num_poses),
-        },
-        # 5: raw strings for both
-        {
-            "Input Receptor": pdb_content,
-            "Input Ligand":   clean_smiles,
-            "Number Samples": str(num_poses),
-        },
-        # 6: "content" key instead of "data"
-        {
-            "Input Receptor": json.dumps([{"type": "pdb", "content": pdb_content}]),
-            "Input Ligand":   json.dumps([{"type": "smiles", "content": clean_smiles}]),
-            "Number Samples": str(num_poses),
-        },
+    receptor_field = ("receptor.pdb", pdb_bytes, "chemical/x-pdb")
+    ligand_field   = json.dumps([{"data": clean_smiles, "type": "smiles"}])
+
+    # Try combinations of (field_name, field_value)
+    combos = [
+        ("Number Samples", "10"),
+        ("Number Samples", "20"),
+        ("Number Samples", "40"),
+        ("Number Samples", "10 Samples"),
+        ("Number Samples", "20 Samples"),
+        ("Number Samples", "40 Samples"),
+        ("Number Samples", "Low (10)"),
+        ("Number Samples", "Medium (20)"),
+        ("Number Samples", "High (40)"),
+        ("Num Samples",    "10"),
+        ("Num Samples",    "20"),
+        ("Num Samples",    "40"),
+        ("num_samples",    "10"),
+        ("num_poses",      "10"),
+        ("Number of Samples", "10"),
+        ("Number of Poses",   "10"),
     ]
 
     responses = []
-    for i, fields in enumerate(formats, 1):
+    for field_name, field_val in combos:
+        fields = {
+            "Input Receptor": receptor_field,
+            "Input Ligand":   ligand_field,
+            field_name:       field_val,
+        }
         try:
             mp = MultipartEncoder(fields=fields)
-            r  = requests.post(
-                url,
-                headers={**hdr, "Content-Type": mp.content_type},
-                data=mp,
-                timeout=60,
-            )
+            r  = requests.post(url,
+                               headers={**hdr, "Content-Type": mp.content_type},
+                               data=mp, timeout=60)
             full = r.text.strip()
-            responses.append(f"Format {i} → HTTP {r.status_code}: {full}")
+            label = f"({repr(field_name)}, {repr(field_val)}) → HTTP {r.status_code}: {full}"
+            responses.append(label)
             if r.status_code == 200:
                 return True, str(r.json()).strip('"\' '), responses
             if r.status_code in (401, 403):
                 return False, f"Auth/IP error: {full}", responses
         except Exception as e:
-            responses.append(f"Format {i} → Exception: {e}")
+            responses.append(f"({repr(field_name)}, {repr(field_val)}) → Exception: {e}")
 
-    return False, "All 6 formats failed — see details below", responses
+    return False, "All combinations failed — see responses for details", responses
 
 def ns_job_status(api_key: str, job_id: str) -> str:
     """Returns status string: pending | running | completed | failed | cancelled"""
