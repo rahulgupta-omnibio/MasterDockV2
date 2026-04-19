@@ -103,6 +103,22 @@ def parse_pdb(txt: str) -> dict:
     return d
 
 
+def protein_centroid(pdb_txt: str):
+    """Compute geometric center of all ATOM/HETATM records in a PDB string."""
+    xs, ys, zs = [], [], []
+    for line in pdb_txt.splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            try:
+                xs.append(float(line[30:38]))
+                ys.append(float(line[38:46]))
+                zs.append(float(line[46:54]))
+            except ValueError:
+                pass
+    if not xs:
+        return 0.0, 0.0, 0.0
+    return round(sum(xs)/len(xs),2), round(sum(ys)/len(ys),2), round(sum(zs)/len(zs),2)
+
+
 def parse_sdf(txt: str):
     sup = Chem.SDMolSupplier()
     sup.SetData(txt, removeHs=False)
@@ -193,9 +209,11 @@ def sd_prep_target(pdb_bytes: bytes, session: str):
 def sd_set_params(session, cx, cy, cz, sx, sy, sz,
                   exhaust, cavity, ric, vina, name, blind):
     params = {"sessionNumber": session, "exhaust": exhaust, "name": name}
+    # boxCenter is ALWAYS required by SwissDock even for blind docking.
+    # For blind mode we send the protein centroid; no boxSize = global search.
+    params["boxCenter"] = f"{cx}_{cy}_{cz}"
     if not blind:
-        params["boxCenter"] = f"{cx}_{cy}_{cz}"
-        params["boxSize"]   = f"{sx}_{sy}_{sz}"
+        params["boxSize"] = f"{sx}_{sy}_{sz}"
     if not vina:
         params["cavity"] = cavity
         params["ric"]    = ric
@@ -346,8 +364,11 @@ with st.sidebar:
                     unsafe_allow_html=True,
                 )
     else:
+        # In blind mode the centroid is computed from the PDB at submit time.
+        # These values are placeholders; sd_set_params receives the real centroid.
         center_x = center_y = center_z = 0.0
         size_x   = size_y   = size_z   = 20.0
+        st.caption("Box center will be auto-computed from the protein geometry.")
 
     # ── Sampling
     st.markdown("### 🎛️ Sampling")
@@ -526,9 +547,18 @@ if submit_btn:
 
     # ── Step 3: parameters
     log("Step 3/5 — Setting parameters…")
+    # For blind docking, compute the protein geometric centroid automatically.
+    # SwissDock always requires a boxCenter even in blind/global mode.
+    if blind and receptor_content:
+        auto_cx, auto_cy, auto_cz = protein_centroid(receptor_content)
+        log(f"Auto-computed box center from protein: ({auto_cx}, {auto_cy}, {auto_cz})")
+        use_cx, use_cy, use_cz = auto_cx, auto_cy, auto_cz
+    else:
+        use_cx, use_cy, use_cz = center_x, center_y, center_z
+
     ok, param_msg = sd_set_params(
         session_id,
-        center_x, center_y, center_z,
+        use_cx, use_cy, use_cz,
         size_x, size_y, size_z,
         int(exhaust), int(cavity), int(ric),
         effective_vina, job_name or "MasterDock",
