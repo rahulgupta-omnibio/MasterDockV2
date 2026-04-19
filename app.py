@@ -129,28 +129,59 @@ def ns_submit_diffdock(api_key: str, pdb_content: str, smiles: str,
                         num_poses: int = 10) -> tuple[bool, str]:
     """
     Submit a DiffDock-L job to Neurosnap.
-    Input receptor  : PDB string
-    Input ligand    : SMILES string
-    Returns (success, job_id_or_error)
+    Tries three field formats to handle API version differences.
+    Returns (success, job_id_or_error).
     """
-    try:
-        mp = MultipartEncoder(fields={
+    url = NS_SUBMIT + "?note=MasterDock"
+    hdr = ns_headers(api_key)
+    pdb_bytes = pdb_content.encode("utf-8")
+
+    # Format A — raw binary file + plain SMILES string (newest API format)
+    # Format B — raw binary file + JSON-encoded SMILES (intermediate format)
+    # Format C — JSON-encoded strings for both (original documented format)
+    formats = [
+        {  # A: file bytes for receptor, plain string for ligand
+            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
+            "Input Ligand":   smiles,
+            "Number Samples": str(num_poses),
+        },
+        {  # B: file bytes for receptor, JSON for ligand
+            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
+            "Input Ligand":   json.dumps([{"type": "smiles", "data": smiles}]),
+            "Number Samples": str(num_poses),
+        },
+        {  # C: JSON strings for both (original documented format)
             "Input Receptor": json.dumps([{"type": "pdb", "data": pdb_content}]),
             "Input Ligand":   json.dumps([{"type": "smiles", "data": smiles}]),
             "Number Samples": str(num_poses),
-        })
-        r = requests.post(
-            NS_SUBMIT + "?note=MasterDock",
-            headers={**ns_headers(api_key), "Content-Type": mp.content_type},
-            data=mp,
-            timeout=60,
-        )
-        if r.status_code == 200:
-            job_id = r.json()
-            return True, str(job_id).strip('"')
-        return False, f"HTTP {r.status_code}: {r.text[:400]}"
-    except Exception as e:
-        return False, str(e)
+        },
+    ]
+
+    last_error = ""
+    for i, fields in enumerate(formats, 1):
+        try:
+            mp = MultipartEncoder(fields=fields)
+            r = requests.post(
+                url,
+                headers={**hdr, "Content-Type": mp.content_type},
+                data=mp,
+                timeout=60,
+            )
+            if r.status_code == 200:
+                job_id = r.json()
+                return True, str(job_id).strip('"\'')
+            last_error = f"Format {i} → HTTP {r.status_code}: {r.text[:300]}"
+            # If 400 with "not provided", try next format
+            # If 401/403 (auth error), stop immediately
+            if r.status_code in (401, 403):
+                return False, last_error
+        except Exception as e:
+            last_error = f"Format {i} → Exception: {e}"
+
+    return False, (
+        f"All submission formats failed. Last error: {last_error}\n\n"
+        "Please verify your API key is correct and has sufficient credits."
+    )
 
 
 def ns_job_status(api_key: str, job_id: str) -> str:
@@ -431,9 +462,19 @@ if submit_btn:
     ok, result = ns_submit_diffdock(api_key, receptor_content, final_smiles, num_poses)
 
     if not ok:
-        st.error(f"❌ Submission failed:\n\n```\n{result}\n```")
-        if "401" in str(result) or "403" in str(result) or "api" in str(result).lower():
-            st.info("💡 Check that your Neurosnap API key is correct. Get one free at neurosnap.ai")
+        st.error("❌ Submission failed")
+        st.code(result, language="text")
+        r_low = result.lower()
+        if "401" in result or "403" in result or "invalid" in r_low or "unauthorized" in r_low:
+            st.warning("🔑 **API key issue** — check your key at neurosnap.ai → Overview → API tab.")
+        elif "400" in result or "not provided" in r_low or "receptor" in r_low:
+            st.warning(
+                "📋 **Field format rejected by Neurosnap.** The app tried 3 formats.\n"
+                "Please email **hello@neurosnap.ai** asking for the current "
+                "DiffDock-L multipart API field format for programmatic access."
+            )
+        elif "credits" in r_low or "payment" in r_low:
+            st.warning("💳 **Insufficient credits** — top up your Neurosnap account.")
         st.stop()
 
     job_id = result
