@@ -126,63 +126,82 @@ def ns_headers(api_key: str) -> dict:
 
 
 def ns_submit_diffdock(api_key: str, pdb_content: str, smiles: str,
-                        num_poses: int = 10) -> tuple[bool, str]:
+                        num_poses: int = 10):
     """
-    Submit a DiffDock-L job to Neurosnap.
-    Tries three field formats to handle API version differences.
-    Returns (success, job_id_or_error).
+    Submit DiffDock-L job to Neurosnap. Tries 6 encoding formats.
+    Returns (success: bool, result: str, all_responses: list).
     """
     url = NS_SUBMIT + "?note=MasterDock"
     hdr = ns_headers(api_key)
     pdb_bytes = pdb_content.encode("utf-8")
 
-    # Format A — raw binary file + plain SMILES string (newest API format)
-    # Format B — raw binary file + JSON-encoded SMILES (intermediate format)
-    # Format C — JSON-encoded strings for both (original documented format)
+    # Canonicalise SMILES via RDKit
+    try:
+        from rdkit import Chem as _Chem
+        _m = _Chem.MolFromSmiles(smiles)
+        clean_smiles = _Chem.MolToSmiles(_m) if _m else smiles
+    except Exception:
+        clean_smiles = smiles
+
     formats = [
-        {  # A: file bytes for receptor, plain string for ligand
-            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
-            "Input Ligand":   smiles,
-            "Number Samples": str(num_poses),
-        },
-        {  # B: file bytes for receptor, JSON for ligand
-            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
-            "Input Ligand":   json.dumps([{"type": "smiles", "data": smiles}]),
-            "Number Samples": str(num_poses),
-        },
-        {  # C: JSON strings for both (original documented format)
+        # 1: exact format from official Neurosnap blog docs
+        {
             "Input Receptor": json.dumps([{"type": "pdb", "data": pdb_content}]),
-            "Input Ligand":   json.dumps([{"type": "smiles", "data": smiles}]),
+            "Input Ligand":   json.dumps([{"data": clean_smiles, "type": "smiles"}]),
+            "Number Samples": str(num_poses),
+        },
+        # 2: data key order swapped
+        {
+            "Input Receptor": json.dumps([{"data": pdb_content, "type": "pdb"}]),
+            "Input Ligand":   json.dumps([{"type": "smiles", "data": clean_smiles}]),
+            "Number Samples": str(num_poses),
+        },
+        # 3: file tuple receptor + JSON ligand
+        {
+            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
+            "Input Ligand":   json.dumps([{"data": clean_smiles, "type": "smiles"}]),
+            "Number Samples": str(num_poses),
+        },
+        # 4: file tuple receptor + plain SMILES
+        {
+            "Input Receptor": ("receptor.pdb", pdb_bytes, "chemical/x-pdb"),
+            "Input Ligand":   clean_smiles,
+            "Number Samples": str(num_poses),
+        },
+        # 5: raw strings for both
+        {
+            "Input Receptor": pdb_content,
+            "Input Ligand":   clean_smiles,
+            "Number Samples": str(num_poses),
+        },
+        # 6: "content" key instead of "data"
+        {
+            "Input Receptor": json.dumps([{"type": "pdb", "content": pdb_content}]),
+            "Input Ligand":   json.dumps([{"type": "smiles", "content": clean_smiles}]),
             "Number Samples": str(num_poses),
         },
     ]
 
-    last_error = ""
+    responses = []
     for i, fields in enumerate(formats, 1):
         try:
             mp = MultipartEncoder(fields=fields)
-            r = requests.post(
+            r  = requests.post(
                 url,
                 headers={**hdr, "Content-Type": mp.content_type},
                 data=mp,
                 timeout=60,
             )
+            full = r.text.strip()
+            responses.append(f"Format {i} → HTTP {r.status_code}: {full}")
             if r.status_code == 200:
-                job_id = r.json()
-                return True, str(job_id).strip('"\'')
-            last_error = f"Format {i} → HTTP {r.status_code}: {r.text[:300]}"
-            # If 400 with "not provided", try next format
-            # If 401/403 (auth error), stop immediately
+                return True, str(r.json()).strip('"\' '), responses
             if r.status_code in (401, 403):
-                return False, last_error
+                return False, f"Auth/IP error: {full}", responses
         except Exception as e:
-            last_error = f"Format {i} → Exception: {e}"
+            responses.append(f"Format {i} → Exception: {e}")
 
-    return False, (
-        f"All submission formats failed. Last error: {last_error}\n\n"
-        "Please verify your API key is correct and has sufficient credits."
-    )
-
+    return False, "All 6 formats failed — see details below", responses
 
 def ns_job_status(api_key: str, job_id: str) -> str:
     """Returns status string: pending | running | completed | failed | cancelled"""
@@ -459,22 +478,23 @@ if submit_btn:
 
     # Submit
     log("Submitting DiffDock-L job to Neurosnap…")
-    ok, result = ns_submit_diffdock(api_key, receptor_content, final_smiles, num_poses)
+    ok, result, all_responses = ns_submit_diffdock(api_key, receptor_content, final_smiles, num_poses)
 
     if not ok:
-        st.error("❌ Submission failed")
-        st.code(result, language="text")
+        st.error("❌ Submission failed — all formats tried")
         r_low = result.lower()
-        if "401" in result or "403" in result or "invalid" in r_low or "unauthorized" in r_low:
-            st.warning("🔑 **API key issue** — check your key at neurosnap.ai → Overview → API tab.")
-        elif "400" in result or "not provided" in r_low or "receptor" in r_low:
-            st.warning(
-                "📋 **Field format rejected by Neurosnap.** The app tried 3 formats.\n"
-                "Please email **hello@neurosnap.ai** asking for the current "
-                "DiffDock-L multipart API field format for programmatic access."
-            )
+        if "401" in result or "403" in result or "auth" in r_low or "invalid" in r_low:
+            st.warning("🔑 **API key / IP issue** — check your key at neurosnap.ai → Overview → API tab.")
         elif "credits" in r_low or "payment" in r_low:
-            st.warning("💳 **Insufficient credits** — top up your Neurosnap account.")
+            st.warning("💳 **Insufficient credits** — top up your Neurosnap account at neurosnap.ai.")
+        with st.expander("📋 Full server responses (click to debug)", expanded=True):
+            for resp in all_responses:
+                st.code(resp, language="text")
+        st.info(
+            "📧 **Next step:** Copy the server responses above and email them to "
+            "**hello@neurosnap.ai** — ask for the correct multipart field format "
+            "for the DiffDock-L API endpoint `/api/job/submit/DiffDock-L`."
+        )
         st.stop()
 
     job_id = result
